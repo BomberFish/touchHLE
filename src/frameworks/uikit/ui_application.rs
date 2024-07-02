@@ -7,12 +7,11 @@
 
 use super::ui_device::*;
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::frameworks::foundation::{ns_array, ns_string};
+use crate::frameworks::foundation::ns_string;
 use crate::frameworks::uikit::ui_nib::load_main_nib_file;
 use crate::mem::MutPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
-    NSZonePtr,
+    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 use crate::window::DeviceOrientation;
 use crate::Environment;
@@ -86,15 +85,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this setStatusBarHidden:hidden]
 }
 
-- (UIInterfaceOrientation)statusBarOrientation {
-    match env.window().current_rotation() {
-        DeviceOrientation::Portrait => UIDeviceOrientationPortrait,
-        DeviceOrientation::LandscapeLeft => UIDeviceOrientationLandscapeLeft,
-        DeviceOrientation::LandscapeRight => UIDeviceOrientationLandscapeRight
-    }
-}
+// TODO: statusBarOrientation getter
 - (())setStatusBarOrientation:(UIInterfaceOrientation)orientation {
-    env.window_mut().rotate_device(match orientation {
+    env.window.rotate_device(match orientation {
         UIDeviceOrientationPortrait => DeviceOrientation::Portrait,
         UIDeviceOrientationLandscapeLeft => DeviceOrientation::LandscapeLeft,
         UIDeviceOrientationLandscapeRight => DeviceOrientation::LandscapeRight,
@@ -108,53 +101,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)idleTimerDisabled {
-    !env.window().is_screen_saver_enabled()
+    !env.window.is_screen_saver_enabled()
 }
 - (())setIdleTimerDisabled:(bool)disabled {
-    env.window_mut().set_screen_saver_enabled(!disabled);
+    env.window.set_screen_saver_enabled(!disabled);
 }
 
 - (bool)openURL:(id)url { // NSURL
-    let ns_string = msg![env; url absoluteString];
+    let ns_string = msg![env; url absoluteURL];
     let url_string = ns_string::to_rust_string(env, ns_string);
-    if let Err(e) = crate::window::open_url(&url_string) {
-        echo!("App opened URL {:?} unsuccessfully ({}), exiting.", url_string, e);
-    } else {
-        echo!("App opened URL {:?}, exiting.", url_string);
-    }
+    crate::window::open_url(&url_string);
 
     // iPhone OS doesn't really do multitasking, so the app expects to close
     // when a URL is opened, e.g. Super Monkey Ball keeps opening the URL every
     // frame! Super Monkey Ball also doesn't check whether opening failed, so
     // it's probably best to always exit.
+    echo!("App opened URL {:?}, exiting.", url_string);
     exit(env);
     true
-}
-
-// TODO: ignore touches
--(())beginIgnoringInteractionEvents {
-    log!("TODO: ignoring beginIgnoringInteractionEvents");
-}
-- (bool)isIgnoringInteractionEvents {
-    false
-}
--(())endIgnoringInteractionEvents {
-    log!("TODO: ignoring endIgnoringInteractionEvents");
-}
-
-- (id)windows {
-    log!("TODO: UIApplication's windows getter is returning only visible windows");
-    let visible_windows: Vec<id> = (*env
-        .framework_state
-        .uikit
-        .ui_view
-        .ui_window
-        .visible_windows).to_vec();
-    for window in &visible_windows {
-        retain(env, *window);
-    }
-    let windows = ns_array::from_vec(env, visible_windows);
-    autorelease(env, windows)
 }
 
 @end
@@ -217,8 +181,8 @@ pub(super) fn UIApplicationMain(
     {
         let pool: id = msg_class![env; NSAutoreleasePool new];
         let delegate: id = msg![env; ui_application delegate];
-        // iOS 3+ apps usually use application:didFinishLaunchingWithOptions:,
-        // and it seems to be prioritized over applicationDidFinishLaunching:.
+        // IOS 3+ apps usually use application:didFinishLaunchingWithOptions:, and it
+        // seems to be prioritized over applicationDidFinishLaunching:.
         if env.objc.object_has_method_named(
             &env.mem,
             delegate,
@@ -226,11 +190,7 @@ pub(super) fn UIApplicationMain(
         ) {
             let empty_dict: id = msg_class![env; NSDictionary dictionary];
             () = msg![env; delegate application:ui_application didFinishLaunchingWithOptions:empty_dict];
-        } else if env.objc.object_has_method_named(
-            &env.mem,
-            delegate,
-            "applicationDidFinishLaunching:",
-        ) {
+        } else {
             () = msg![env; delegate applicationDidFinishLaunching:ui_application];
         }
 
@@ -244,17 +204,11 @@ pub(super) fn UIApplicationMain(
         () = msg![env; view layoutSubviews];
     }
 
-    // Send applicationDidBecomeActive now that the application is ready to
-    // become active.
+    // Send applicationDidBecomeActive now that the application is ready to become active.
     {
         let pool: id = msg_class![env; NSAutoreleasePool new];
         let delegate: id = msg![env; ui_application delegate];
-        if env
-            .objc
-            .object_has_method_named(&env.mem, delegate, "applicationDidBecomeActive:")
-        {
-            () = msg![env; delegate applicationDidBecomeActive:ui_application];
-        }
+        () = msg![env; delegate applicationDidBecomeActive:ui_application];
         let _: () = msg![env; pool drain];
     }
 
@@ -273,30 +227,19 @@ pub(super) fn UIApplicationMain(
 /// Tell the app it's about to quit and then exit.
 pub(super) fn exit(env: &mut Environment) {
     let ui_application: id = msg_class![env; UIApplication sharedApplication];
+    let delegate: id = msg![env; ui_application delegate];
 
     // TODO: send notifications also
 
     {
         let pool: id = msg_class![env; NSAutoreleasePool new];
-        let delegate: id = msg![env; ui_application delegate];
-        if env
-            .objc
-            .object_has_method_named(&env.mem, delegate, "applicationWillResignActive:")
-        {
-            () = msg![env; delegate applicationWillResignActive:ui_application];
-        }
+        let _: () = msg![env; delegate applicationWillResignActive:ui_application];
         let _: () = msg![env; pool drain];
     };
 
     {
         let pool: id = msg_class![env; NSAutoreleasePool new];
-        let delegate: id = msg![env; ui_application delegate];
-        if env
-            .objc
-            .object_has_method_named(&env.mem, delegate, "applicationWillTerminate:")
-        {
-            () = msg![env; delegate applicationWillTerminate:ui_application];
-        }
+        let _: () = msg![env; delegate applicationWillTerminate:ui_application];
         let _: () = msg![env; pool drain];
     };
 
