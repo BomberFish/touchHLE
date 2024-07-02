@@ -1,6 +1,6 @@
 on:
   push:
-    branches: [ "patch-35" ]
+    branches: [ "trunk" ]
   pull_request:
     branches: [ "trunk" ]
 env:
