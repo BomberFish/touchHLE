@@ -8,6 +8,7 @@
 use super::ns_property_list_serialization::deserialize_plist_from_file;
 use super::{ns_string, ns_url, NSUInteger};
 use crate::abi::VaList;
+use crate::frameworks::foundation::NSInteger;
 use crate::fs::GuestPath;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -224,6 +225,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     let res = host_obj.lookup(env, key);
     *env.objc.borrow_mut(this) = host_obj;
     res
+}
+
+- (NSInteger)fileSize {
+    let file_size_key = ns_string::get_static_str(env, "fileSize");
+    let host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let res = host_obj.lookup(env, file_size_key);
+    *env.objc.borrow_mut(this) = host_obj;
+    msg![env; res intValue]
 }
 
 @end

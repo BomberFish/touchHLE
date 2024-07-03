@@ -29,8 +29,8 @@ use crate::frameworks::foundation::ns_string;
 use crate::mach_o::{MachO, SectionType};
 use crate::mem::{ConstVoidPtr, GuestUSize, Mem, MutPtr, Ptr};
 use crate::objc::{nil, ObjC};
-use crate::Environment;
-use std::collections::HashMap;
+use crate::{log, Environment};
+use std::collections::{HashMap, HashSet};
 
 pub type HostFunction = &'static dyn CallFromGuest;
 
@@ -163,6 +163,7 @@ pub struct Dyld {
     thread_exit_routine: Option<GuestFunction>,
     constants_to_link_later: Vec<(MutPtr<ConstVoidPtr>, &'static HostConstant)>,
     non_lazy_host_functions: HashMap<&'static str, GuestFunction>,
+    lazy_relocs: HashSet<u32>,
 }
 
 impl Dyld {
@@ -186,6 +187,7 @@ impl Dyld {
             thread_exit_routine: None,
             constants_to_link_later: Vec::new(),
             non_lazy_host_functions: HashMap::new(),
+            lazy_relocs: HashSet::new(),
         }
     }
 
@@ -212,7 +214,7 @@ impl Dyld {
         objc.register_host_selectors(mem);
 
         for bin in bins {
-            self.setup_lazy_linking(bin, mem);
+            self.setup_lazy_linking(bin, bins, mem);
             // Must happen before `register_bin_classes`, else superclass
             // pointers will be wrong.
             self.do_non_lazy_linking(bin, bins, mem, objc);
@@ -222,6 +224,11 @@ impl Dyld {
         objc.register_bin_categories(&bins[0], mem);
 
         ns_string::register_constant_strings(&bins[0], mem, objc);
+
+        log!(
+            "__Znwm_ptr linked? = {:#x}",
+            mem.read(Ptr::<u32, false>::from_bits(0x7d05c))
+        );
     }
 
     /// [Self::do_initial_linking] but for when this is the app picker's special
@@ -248,12 +255,81 @@ impl Dyld {
     ///
     /// These stubs already exist in the binary, but they need to be rewritten
     /// so that they will invoke our dynamic linker.
-    fn setup_lazy_linking(&self, bin: &MachO, mem: &mut Mem) {
+    fn setup_lazy_linking(&mut self, bin: &MachO, bins: &[MachO], mem: &mut Mem) {
         let Some(stubs) = bin.get_section(SectionType::SymbolStubs) else {
             return;
         };
 
-        let entry_size = stubs.dyld_indirect_symbol_info.as_ref().unwrap().entry_size;
+        let info = stubs.dyld_indirect_symbol_info.as_ref().unwrap();
+        let entry_size = info.entry_size;
+
+        // case for StubClose
+        if entry_size == 4 {
+            assert!(stubs.size % entry_size == 0);
+            let stub_count = stubs.size / entry_size;
+
+            'ptr_loop: for i in 0..stub_count {
+                let Some(symbol) = info.indirect_undef_symbols[i as usize].as_deref() else {
+                    continue;
+                };
+
+                let ptr: MutPtr<u32> = Ptr::from_bits(stubs.addr + i * entry_size);
+                let instr = mem.read(ptr);
+
+                // LDR PC, [PC, #offset]
+                assert!(instr & 0xfffff000 == 0xe59ff000);
+                let offset = instr & 0xfff;
+                let ptr_ptr: MutPtr<ConstVoidPtr> = Ptr::from_bits(ptr.to_bits() + offset + 8);
+
+                log_dbg!(
+                    "HACK: Linking close lazy symbol {:?} at {:?} in \"{}\", offset={:#x}",
+                    symbol,
+                    ptr,
+                    bin.name,
+                    offset
+                );
+
+                for other_bin in bins {
+                    if let Some(&addr) = other_bin.exported_symbols.get(symbol) {
+                        log_dbg!(
+                            "Linked lazy symbol {:?} at {:?} to {:#x}",
+                            symbol,
+                            ptr_ptr,
+                            addr
+                        );
+                        mem.write(ptr_ptr, Ptr::from_bits(addr));
+                        self.lazy_relocs.insert(ptr_ptr.to_bits());
+                        continue 'ptr_loop;
+                    }
+                }
+
+                if let Some((symbol, _)) = search_lists(function_lists::FUNCTION_LISTS, symbol) {
+                    // We want the same symbol name to always point to the same
+                    // function. It could point to a specific stub entry, but it's
+                    // easier to just create a new function and point all the stub
+                    // entries to it.
+                    let trampoline_ptr = self
+                        .create_proc_address_no_inval(mem, symbol)
+                        .unwrap()
+                        .to_ptr();
+                    mem.write(ptr_ptr, trampoline_ptr);
+                    self.lazy_relocs.insert(ptr_ptr.to_bits());
+                    log_dbg!(
+                        "Linked lazy host function {} at {:?}",
+                        symbol,
+                        trampoline_ptr
+                    );
+                    continue;
+                }
+                if let Some((_, template)) = search_lists(constant_lists::CONSTANT_LISTS, symbol) {
+                    // Delay linking of constant until we have a `&mut Environment`,
+                    // that makes it much easier to build NSString objects etc.
+                    self.constants_to_link_later.push((ptr_ptr, template));
+                    continue;
+                }
+            }
+            return;
+        }
 
         // two or three A32 instructions (PIC stub needs one more) followed by
         // the address or offset of the corresponding __la_symbol_ptr
@@ -300,6 +376,11 @@ impl Dyld {
         let mut unhandled_relocations: HashMap<&str, Vec<u32>> = HashMap::new();
         for &(ptr_ptr, ref name) in &bin.external_relocations {
             let ptr_ptr: MutPtr<ConstVoidPtr> = Ptr::from_bits(ptr_ptr);
+            if self.lazy_relocs.contains(&ptr_ptr.to_bits()) {
+                // Already handled by `setup_lazy_linking`
+                continue;
+            }
+
             // There will be an existing value at the address, which is an
             // offset that should be applied to the external symbol's address.
             // It is often 0, but not always.
@@ -332,6 +413,12 @@ impl Dyld {
                     .push(ptr_ptr.to_bits());
                 continue;
             };
+            log!(
+                "Write reloc {:?} target={:?} offset={:?}",
+                ptr_ptr,
+                target,
+                offset
+            );
             // wrapping_add() is used in case the offset is negative. I haven't
             // seen it happen, but it would make sense if that is allowed.
             mem.write(

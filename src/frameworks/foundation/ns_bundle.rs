@@ -21,12 +21,12 @@ use std::collections::HashSet;
 const LANG_ID_TO_LANG_PROJ: &[(&str, &str)] = &[
     ("da", "Danish.lproj"),
     ("nl", "Dutch.lproj"),
-    ("en", "English.lproj"),
+    ("en", "en.lproj"),
     ("fi", "Finnish.lproj"),
     ("fr", "French.lproj"),
     ("de", "German.lproj"),
     ("it", "Italian.lproj"),
-    ("ja", "Japanese.lproj"),
+    ("ja", "ja.lproj"),
     ("no", "Norwegian.lproj"),
     ("es", "Spanish.lproj"),
     ("sv", "Swedish.lproj"),
@@ -199,6 +199,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let dict: id = msg![env; dict initWithContentsOfFile:plist_path];
     env.objc.borrow_mut::<NSBundleHostObject>(this).info_dictionary = Some(dict);
     dict
+}
+
+- (id)objectForInfoDictionaryKey:(id)key { // NSString*
+    let dict: id = msg![env; this infoDictionary];
+    msg![env; dict objectForKey:key]
 }
 
 - (id)localizations {

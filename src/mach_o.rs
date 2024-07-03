@@ -22,12 +22,13 @@ use crate::abi::GuestFunction;
 use crate::fs::{Fs, GuestPath};
 use crate::mem::{Mem, Ptr};
 use mach_object::{
-    cpu_subtype_t, vm_prot_t, DyLib, LoadCommand, MachCommand, OFile, Symbol, SymbolIter,
-    ThreadState, N_ARM_THUMB_DEF, S_LAZY_SYMBOL_POINTERS, S_MOD_INIT_FUNC_POINTERS,
-    S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
+    cpu_subtype_t, vm_prot_t, Bind, BindOpCode, BindSymbolType, DyLib, LoadCommand, MachCommand,
+    OFile, Symbol, SymbolIter, ThreadState, N_ARM_THUMB_DEF, S_LAZY_SYMBOL_POINTERS,
+    S_MOD_INIT_FUNC_POINTERS, S_NON_LAZY_SYMBOL_POINTERS, S_SYMBOL_STUBS,
 };
 use std::collections::HashMap;
 use std::io::{Cursor, Seek, SeekFrom};
+use std::rc::Rc;
 
 const VM_PROT_READ: vm_prot_t = 1;
 const VM_PROT_WRITE: vm_prot_t = 2;
@@ -301,6 +302,7 @@ impl MachO {
         let mut first_read_write_segment_base: Option<u32> = None;
         let mut text_segment_base: Option<u32> = None;
         let mut all_sections = Vec::new();
+        let mut all_segments = Vec::new();
         let mut sym_tab_info: Option<(u32, u32, u32, u32)> = None;
 
         // Info used for the result
@@ -373,6 +375,7 @@ impl MachO {
                         }
                     }
 
+                    all_segments.push((vmaddr, vmsize, segname));
                     all_sections.extend_from_slice(&sections);
                 }
                 LoadCommand::SymTab {
@@ -548,8 +551,96 @@ impl MachO {
                 }
                 // LoadCommand::DyldInfo is apparently a newer thing that 2008
                 // games don't have. Ignore for now? Unsure if/when iOS got it.
-                LoadCommand::DyldInfo { .. } => {
-                    log!("Warning! DyldInfo is not handled.");
+                LoadCommand::DyldInfo {
+                    bind_off,
+                    bind_size,
+                    ..
+                } => {
+                    let bind_iter =
+                        Bind::parse(&bytes[bind_off as usize..][..bind_size as usize], 4);
+
+                    let mut symbol: Option<String> = None;
+                    let mut sym_type: Option<BindSymbolType> = None;
+                    // let mut addend = 0usize;
+                    let mut segment_addr: Option<u32> = None;
+                    let mut segment_offset = 0usize;
+
+                    let mut do_bind =
+                        |segment_addr: u32,
+                         segment_offset: usize,
+                         symbol: String,
+                         sym_type: BindSymbolType| {
+                            let addr = segment_addr as usize + segment_offset;
+
+                            match sym_type {
+                                BindSymbolType::Pointer => {
+                                    log!("Pointer bind: {:#x} -> {}", addr, symbol);
+                                    external_relocations.push((addr as u32, symbol));
+                                }
+                                _ => unimplemented!(
+                                    "Unhandled DyldInfo bind symbol type: {:?}",
+                                    sym_type
+                                ),
+                            }
+                        };
+
+                    for op in bind_iter.opcodes() {
+                        log!("Bind op: {:?}", op);
+
+                        match op {
+                            BindOpCode::SetDyLibrary(_) => (), // the way we resolve symbols means we don't need to care about this
+                            BindOpCode::SetSymbol { name, flags } => {
+                                symbol = Some(name);
+                            }
+                            BindOpCode::SetSymbolType(value) => {
+                                sym_type = Some(value);
+                            }
+                            // BindOpCode::SetAddend(value) => {
+                            //     addend = value;
+                            // }
+                            BindOpCode::SetSegmentOffset {
+                                segment_index: index,
+                                segment_offset: offset,
+                            } => {
+                                segment_addr = Some(all_segments[index as usize].0);
+                                segment_offset = offset;
+                            }
+                            BindOpCode::AddAddress { offset } => {
+                                segment_offset = segment_offset.wrapping_add_signed(offset);
+                            }
+                            BindOpCode::Bind => {
+                                do_bind(
+                                    segment_addr.unwrap(),
+                                    segment_offset,
+                                    symbol.clone().unwrap(),
+                                    sym_type.unwrap(),
+                                );
+                                segment_offset += 4;
+                            }
+                            BindOpCode::BindAndAddAddress { offset } => {
+                                do_bind(
+                                    segment_addr.unwrap(),
+                                    segment_offset,
+                                    symbol.clone().unwrap(),
+                                    sym_type.unwrap(),
+                                );
+                                segment_offset += offset as usize + 4;
+                            }
+                            BindOpCode::BindAndSkipping { times, skip } => {
+                                for _ in 0..times {
+                                    do_bind(
+                                        segment_addr.unwrap(),
+                                        segment_offset,
+                                        symbol.clone().unwrap(),
+                                        sym_type.unwrap(),
+                                    );
+                                    segment_offset += skip as usize + 4;
+                                }
+                            }
+                            BindOpCode::Done => (),
+                            _ => panic!("Unhandled DyldInfo bind opcode: {:?}", op),
+                        }
+                    }
                 }
                 _ => (),
             }

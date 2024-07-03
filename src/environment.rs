@@ -867,6 +867,7 @@ impl Environment {
         assert!(self.threads[initial_thread].context.is_none());
 
         loop {
+            // log!("run_inner()");
             // 100,000 ticks is an arbitrary number. It needs to be reasonably
             // large so we aren't jumping in and out of dynarmic or trying to
             // poll for events too often. At the same time, very large values

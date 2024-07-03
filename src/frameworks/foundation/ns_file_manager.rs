@@ -5,8 +5,11 @@
  */
 //! `NSFileManager` etc.
 
+use std::io::{Seek, SeekFrom};
+
 use super::{ns_array, ns_string, NSUInteger};
 use crate::dyld::{export_c_func, FunctionExports};
+use crate::frameworks::foundation::ns_dictionary::dict_from_keys_and_objects;
 use crate::fs::{GuestPath, GuestPathBuf};
 use crate::mem::MutPtr;
 use crate::objc::{
@@ -194,6 +197,23 @@ pub const CLASSES: ClassExports = objc_classes! {
         todo!();
     }
     true
+}
+
+- (id)attributesOfItemAtPath:(id)path // NSString*
+                       error:(MutPtr<id>)error { // NSError**
+    let path = if !path.is_null() { ns_string::to_rust_string(env, path) } else { "".into() };
+    let (file_size) = match env.fs.open(GuestPath::new(path.as_ref())) {
+        Ok(mut f) => {
+            let file_size = f.seek(SeekFrom::End(0)).unwrap();
+
+            (file_size)
+        },
+        Err(_) => (0),
+    };
+    let file_size_key: id = ns_string::get_static_str(env, "fileSize");
+    let file_size_value: id = msg_class![env; NSNumber numberWithUnsignedLongLong:file_size];
+    let dict = dict_from_keys_and_objects(env, &[(file_size_key, file_size_value)]);
+    autorelease(env, dict)
 }
 
 @end

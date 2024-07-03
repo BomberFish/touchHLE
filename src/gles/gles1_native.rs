@@ -107,6 +107,9 @@ impl GLES for GLES1Native {
         gles11::AlphaFuncx(func, ref_)
     }
     unsafe fn BlendFunc(&mut self, sfactor: GLenum, dfactor: GLenum) {
+        gles11::Enable(gles11::BLEND);
+        gles11::Disable(gles11::ALPHA_TEST);
+        // gles11::BlendFunc(gles11::SRC_ALPHA, gles11::ONE_MINUS_SRC_ALPHA);
         gles11::BlendFunc(sfactor, dfactor)
     }
     unsafe fn ColorMask(
